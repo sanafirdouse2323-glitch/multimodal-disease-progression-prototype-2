@@ -2,7 +2,7 @@
 
 ## Prototype task
 
-The baseline predicts the stage label at a patient's **next observed visit**, using the current visit's multimodal feature vector. Follow-up intervals are intentionally irregular. The stage labels (0–3), feature vectors and patients are synthetic.
+This baseline predicts the stage label at a patient's **next observed visit**, using the current visit's multimodal feature vector. Follow-up intervals are intentionally irregular. Stage labels (0–3), feature vectors and patients are synthetic.
 
 ## Advertised directions: current status
 
@@ -20,8 +20,8 @@ The baseline predicts the stage label at a patient's **next observed visit**, us
 - Use only authorised datasets in approved research environments with appropriate governance and ethics review.
 - Synthetic stage labels are not a clinical scale.
 - Synthetic performance is only a software check, not medical evidence.
-- Agree with a clinical/research supervisor on the target, time zero, forecast horizon, split unit, missingness strategy and baselines before real-data work.
+- Agree with a research/clinical supervisor on target, time zero, forecast horizon, split unit, missingness strategy and baselines before real-data work.
 
-## Evaluation in this prototype
+## Evaluation
 
 Patients—not visits—are split into training, validation and test sets. Imputation and scaling statistics are estimated from training examples only. Test metrics go to `results/metrics.json`; predictions go to `results/test_predictions.csv`. Results describe synthetic data only.
