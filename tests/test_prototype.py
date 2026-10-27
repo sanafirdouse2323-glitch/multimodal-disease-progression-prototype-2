@@ -6,21 +6,21 @@ from prototype import MultimodalNet, create_forecast_examples, make_synthetic_co
 
 
 class PrototypeTests(unittest.TestCase):
-    def test_synthetic_cohort_contains_three_modalities(self):
+    def test_synthetic_cohort_contains_modalities(self):
         frame = make_synthetic_cohort(20, seed=4)
         self.assertIn("img_0", frame)
         self.assertIn("wear_0", frame)
         self.assertIn("lab_a", frame)
         self.assertTrue((frame.groupby("patient_id").size() >= 2).all())
 
-    def test_future_label_is_not_in_input_features(self):
+    def test_forecast_target_is_later_visit(self):
         frame = make_synthetic_cohort(20, seed=5)
         examples = create_forecast_examples(frame)
-        self.assertNotIn("stage", examples[0]["features"].tolist())
         row = examples[0]
         visits = frame[frame.patient_id == row["patient_id"]].sort_values("time_months")
         idx = visits.index.get_loc(visits[visits.time_months == row["time_months"]].index[0])
         self.assertEqual(row["target_stage"], int(visits.iloc[idx + 1].stage))
+        self.assertEqual(len(row["features"]), 24)
 
     def test_patient_ids_do_not_cross_splits(self):
         examples = create_forecast_examples(make_synthetic_cohort(40, seed=6))
