@@ -141,7 +141,7 @@ class MultimodalNet(nn.Module):
         super().__init__()
         self.image_encoder = nn.Sequential(nn.Linear(8, 24), nn.ReLU(), nn.Linear(24, 16), nn.ReLU())
         self.wearable_encoder = nn.Sequential(nn.Linear(6, 20), nn.ReLU(), nn.Linear(20, 16), nn.ReLU())
-        self.tabular_encoder = nn.Sequential(nn.Linear(10, 24), nn.ReLU(), nn.Linear(24, 16), nn.ReLU())
+        self.tabular_encoder = nn.Sequential(nn.Linear(6, 24), nn.ReLU(), nn.Linear(24, 16), nn.ReLU())
         self.fusion = nn.Sequential(nn.Linear(48, 32), nn.ReLU(), nn.Dropout(0.15))
         self.forecast_head = nn.Linear(32, N_STAGES)
         self.current_head = nn.Linear(32, N_STAGES)
