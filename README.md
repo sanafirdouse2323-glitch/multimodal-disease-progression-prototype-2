@@ -55,7 +55,7 @@ These metrics describe this synthetic experiment only. They should not be read a
 
 ## Set up
 
-Python 3.10 or later is recommended.
+Python 3.11 is the version used by the GitHub Actions tests. Other Python versions may work with compatible package versions, but they are not currently covered by CI.
 
 Clone the repository and create a virtual environment:
 
