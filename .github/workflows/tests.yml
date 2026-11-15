@@ -38,7 +38,7 @@ jobs:
           import numpy as np
           import pandas as pd
 
-          from prototype import FEATURES, STAGE_LABELS, load_model_checkpoint
+          from prototype import FEATURES, STAGE_LABELS, MultimodalNet, classification_metrics, load_model_checkpoint
 
           output_dir = Path("results/ci-smoke")
           metrics_path = output_dir / "metrics.json"
@@ -84,14 +84,28 @@ jobs:
               raise AssertionError("Prediction targets contain an unknown stage label")
           if not predictions["predicted_stage"].isin(STAGE_LABELS).all():
               raise AssertionError("Predictions contain an unknown stage label")
+          if not np.array_equal(
+              predictions["predicted_stage"].to_numpy(),
+              probabilities.argmax(axis=1),
+          ):
+              raise AssertionError("Predicted stages do not match the largest class probabilities")
+
+          recomputed_metrics = classification_metrics(
+              predictions["target_stage"].tolist(),
+              predictions["predicted_stage"].tolist(),
+          )
+          if not np.isclose(recomputed_metrics["accuracy"], test_metrics["accuracy"]):
+              raise AssertionError("Saved accuracy does not match the prediction file")
+          if not np.isclose(recomputed_metrics["macro_f1"], test_metrics["macro_f1"]):
+              raise AssertionError("Saved macro F1 does not match the prediction file")
 
           model, checkpoint = load_model_checkpoint(checkpoint_path)
           if checkpoint["feature_order"] != FEATURES:
               raise AssertionError("Saved checkpoint feature order is incorrect")
           if checkpoint["stage_labels"] != list(STAGE_LABELS):
               raise AssertionError("Saved checkpoint stage labels are incorrect")
-          if not isinstance(model, object):
-              raise AssertionError("Checkpoint loader did not return a model")
+          if not isinstance(model, MultimodalNet):
+              raise AssertionError("Checkpoint loader did not return a MultimodalNet")
 
           print("Smoke outputs, probability values and checkpoint reload verified.")
           PY
