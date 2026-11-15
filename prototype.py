@@ -172,7 +172,7 @@ class ForecastDataset(Dataset):
         raw = np.stack([e["features"] for e in examples]).astype(np.float32)
         if raw.ndim != 2 or raw.shape[1] != len(FEATURES):
             raise ValueError(f"examples must contain {len(FEATURES)} features")
-        self.x = np.nan_to_num(raw, nan=mean)
+        self.x = np.where(np.isfinite(raw), raw, mean).astype(np.float32)
         self.x = np.clip((self.x - mean) / scale, -8, 8).astype(np.float32)
         self.y = np.asarray([e["target_stage"] for e in examples], dtype=np.int64)
         self.current_y = np.asarray([e["current_stage"] for e in examples], dtype=np.int64)
