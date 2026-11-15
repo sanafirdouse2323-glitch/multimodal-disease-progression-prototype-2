@@ -106,6 +106,7 @@ class PrototypeTests(unittest.TestCase):
     def test_dataset_imputes_missing_values_and_returns_finite_tensors(self):
         features = np.arange(len(FEATURES), dtype=np.float32)
         features[0] = np.nan
+        features[1] = np.inf
         dataset = ForecastDataset(
             [{"features": features, "target_stage": 2, "current_stage": 1}],
             mean=np.zeros(len(FEATURES), dtype=np.float32),
@@ -116,6 +117,7 @@ class PrototypeTests(unittest.TestCase):
         self.assertEqual(tuple(x.shape), (len(FEATURES),))
         self.assertTrue(torch.isfinite(x).all())
         self.assertEqual(float(x[0]), 0.0)
+        self.assertEqual(float(x[1]), 0.0)
         self.assertEqual(int(target), 2)
         self.assertEqual(int(current), 1)
 
