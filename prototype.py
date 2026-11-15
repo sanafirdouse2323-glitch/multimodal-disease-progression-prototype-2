@@ -19,6 +19,20 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 N_STAGES = 4
+STAGE_LABELS = tuple(range(N_STAGES))
+
+IMAGE_FEATURES = [f"img_{i}" for i in range(8)]
+WEARABLE_FEATURES = [f"wear_{i}" for i in range(6)]
+CLINICAL_FEATURES = ["age_scaled", "sex_binary", "lab_a", "lab_b"]
+MISSINGNESS_FEATURES = ["image_missing", "wearable_missing"]
+TABULAR_FEATURES = CLINICAL_FEATURES + MISSINGNESS_FEATURES
+FEATURES = IMAGE_FEATURES + WEARABLE_FEATURES + TABULAR_FEATURES
+
+IMAGE_SLICE = slice(0, len(IMAGE_FEATURES))
+WEARABLE_START = len(IMAGE_FEATURES)
+WEARABLE_SLICE = slice(WEARABLE_START, WEARABLE_START + len(WEARABLE_FEATURES))
+TABULAR_START = WEARABLE_START + len(WEARABLE_FEATURES)
+TABULAR_SLICE = slice(TABULAR_START, len(FEATURES))
 
 
 @dataclass
@@ -35,6 +49,8 @@ def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def make_synthetic_cohort(n_patients: int = 240, seed: int = 42) -> pd.DataFrame:
@@ -84,13 +100,6 @@ def make_synthetic_cohort(n_patients: int = 240, seed: int = 42) -> pd.DataFrame
     return pd.DataFrame(rows)
 
 
-FEATURES = (
-    [f"img_{i}" for i in range(8)]
-    + [f"wear_{i}" for i in range(6)]
-    + ["age_scaled", "sex_binary", "lab_a", "lab_b", "image_missing", "wearable_missing"]
-)
-
-
 def create_forecast_examples(frame: pd.DataFrame) -> list[dict]:
     """Predict the next observed visit's stage from current-visit features only."""
     examples = []
@@ -113,45 +122,143 @@ def create_forecast_examples(frame: pd.DataFrame) -> list[dict]:
 
 def patient_split(examples: list[dict], seed: int):
     """Split by patient so visits from one patient cannot cross data partitions."""
+    if not examples:
+        raise ValueError("examples must not be empty")
     patients = np.array(sorted({e["patient_id"] for e in examples}))
+    if len(patients) < 3:
+        raise ValueError("at least three patients are required for train/validation/test splits")
     train_val_ids, test_ids = train_test_split(patients, test_size=0.2, random_state=seed)
     train_ids, val_ids = train_test_split(train_val_ids, test_size=0.2, random_state=seed)
     id_sets = [set(train_ids), set(val_ids), set(test_ids)]
     return tuple([[e for e in examples if e["patient_id"] in ids] for ids in id_sets])
 
 
+def fit_preprocessor(train_examples: list[dict]) -> tuple[np.ndarray, np.ndarray]:
+    """Fit imputation and scaling values using training examples only."""
+    if not train_examples:
+        raise ValueError("train_examples must not be empty")
+    matrix = np.stack([e["features"] for e in train_examples]).astype(np.float64)
+    if matrix.ndim != 2 or matrix.shape[1] != len(FEATURES):
+        raise ValueError(f"training features must have shape (n, {len(FEATURES)})")
+
+    valid = np.isfinite(matrix)
+    counts = valid.sum(axis=0)
+    totals = np.where(valid, matrix, 0.0).sum(axis=0)
+    mean = np.divide(totals, counts, out=np.zeros(len(FEATURES)), where=counts > 0)
+
+    centered = np.where(valid, matrix - mean, 0.0)
+    variance = np.divide(
+        np.square(centered).sum(axis=0),
+        counts,
+        out=np.zeros(len(FEATURES)),
+        where=counts > 0,
+    )
+    scale = np.sqrt(variance)
+    scale = np.where(np.isfinite(scale) & (scale > 1e-6), scale, 1.0)
+    return mean.astype(np.float32), scale.astype(np.float32)
+
+
 class ForecastDataset(Dataset):
     def __init__(self, examples, mean: np.ndarray, scale: np.ndarray):
-        raw = np.stack([e["features"] for e in examples])
+        if not examples:
+            raise ValueError("examples must not be empty")
+        mean = np.asarray(mean, dtype=np.float32)
+        scale = np.asarray(scale, dtype=np.float32)
+        if mean.shape != (len(FEATURES),) or scale.shape != (len(FEATURES),):
+            raise ValueError(f"mean and scale must each contain {len(FEATURES)} values")
+        if not np.isfinite(mean).all() or not np.isfinite(scale).all() or (scale <= 0).any():
+            raise ValueError("preprocessing values must be finite and scales must be positive")
+
+        raw = np.stack([e["features"] for e in examples]).astype(np.float32)
+        if raw.ndim != 2 or raw.shape[1] != len(FEATURES):
+            raise ValueError(f"examples must contain {len(FEATURES)} features")
         self.x = np.nan_to_num(raw, nan=mean)
         self.x = np.clip((self.x - mean) / scale, -8, 8).astype(np.float32)
         self.y = np.asarray([e["target_stage"] for e in examples], dtype=np.int64)
         self.current_y = np.asarray([e["current_stage"] for e in examples], dtype=np.int64)
+        if not np.isin(self.y, STAGE_LABELS).all() or not np.isin(self.current_y, STAGE_LABELS).all():
+            raise ValueError(f"stage targets must be in {STAGE_LABELS}")
 
     def __len__(self):
         return len(self.y)
 
     def __getitem__(self, index):
-        return torch.from_numpy(self.x[index]), torch.tensor(self.y[index]), torch.tensor(self.current_y[index])
+        return (
+            torch.from_numpy(self.x[index]),
+            torch.tensor(self.y[index]),
+            torch.tensor(self.current_y[index]),
+        )
 
 
 class MultimodalNet(nn.Module):
     """Separate feature-group encoders and fused future/current-stage heads."""
+
     def __init__(self):
         super().__init__()
-        self.image_encoder = nn.Sequential(nn.Linear(8, 24), nn.ReLU(), nn.Linear(24, 16), nn.ReLU())
-        self.wearable_encoder = nn.Sequential(nn.Linear(6, 20), nn.ReLU(), nn.Linear(20, 16), nn.ReLU())
-        self.tabular_encoder = nn.Sequential(nn.Linear(6, 24), nn.ReLU(), nn.Linear(24, 16), nn.ReLU())
+        self.image_encoder = nn.Sequential(
+            nn.Linear(len(IMAGE_FEATURES), 24), nn.ReLU(), nn.Linear(24, 16), nn.ReLU()
+        )
+        self.wearable_encoder = nn.Sequential(
+            nn.Linear(len(WEARABLE_FEATURES), 20), nn.ReLU(), nn.Linear(20, 16), nn.ReLU()
+        )
+        self.tabular_encoder = nn.Sequential(
+            nn.Linear(len(TABULAR_FEATURES), 24), nn.ReLU(), nn.Linear(24, 16), nn.ReLU()
+        )
         self.fusion = nn.Sequential(nn.Linear(48, 32), nn.ReLU(), nn.Dropout(0.15))
         self.forecast_head = nn.Linear(32, N_STAGES)
         self.current_head = nn.Linear(32, N_STAGES)
 
     def forward(self, x):
-        image = self.image_encoder(x[:, 0:8])
-        wearable = self.wearable_encoder(x[:, 8:14])
-        tabular = self.tabular_encoder(x[:, 14:24])
+        if x.ndim != 2 or x.shape[1] != len(FEATURES):
+            raise ValueError(
+                f"model input must have shape (batch, {len(FEATURES)}); received {tuple(x.shape)}"
+            )
+        image = self.image_encoder(x[:, IMAGE_SLICE])
+        wearable = self.wearable_encoder(x[:, WEARABLE_SLICE])
+        tabular = self.tabular_encoder(x[:, TABULAR_SLICE])
         fused = self.fusion(torch.cat([image, wearable, tabular], dim=1))
         return self.forecast_head(fused), self.current_head(fused)
+
+
+def load_model_checkpoint(checkpoint_path: str | Path, map_location="cpu"):
+    """Load a checkpoint produced by this prototype and validate its feature schema."""
+    checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=True)
+    if checkpoint.get("feature_order") != FEATURES:
+        raise ValueError("checkpoint feature order does not match this version of the prototype")
+    if checkpoint.get("stage_labels") != list(STAGE_LABELS):
+        raise ValueError("checkpoint stage labels do not match this version of the prototype")
+    if "state_dict" not in checkpoint:
+        raise ValueError("checkpoint does not contain model weights")
+
+    model = MultimodalNet()
+    model.load_state_dict(checkpoint["state_dict"], strict=True)
+    model.to(map_location)
+    model.eval()
+    return model, checkpoint
+
+
+def classification_metrics(targets, predictions) -> dict:
+    """Calculate metrics across all four defined synthetic stage labels."""
+    if len(targets) == 0 or len(predictions) == 0:
+        raise ValueError("targets and predictions must not be empty")
+    if len(targets) != len(predictions):
+        raise ValueError("targets and predictions must have the same length")
+    if not np.isin(targets, STAGE_LABELS).all() or not np.isin(predictions, STAGE_LABELS).all():
+        raise ValueError(f"targets and predictions must use labels {STAGE_LABELS}")
+
+    return {
+        "accuracy": float(accuracy_score(targets, predictions)),
+        "macro_f1": float(
+            f1_score(
+                targets,
+                predictions,
+                labels=list(STAGE_LABELS),
+                average="macro",
+                zero_division=0,
+            )
+        ),
+        "class_support": np.bincount(targets, minlength=N_STAGES).astype(int).tolist(),
+    }
 
 
 def evaluate(model, loader, device):
@@ -162,11 +269,7 @@ def evaluate(model, loader, device):
             logits, _ = model(x.to(device))
             targets.extend(y.tolist())
             predictions.extend(logits.argmax(1).cpu().tolist())
-    return {
-        "n_examples": len(targets),
-        "accuracy": float(accuracy_score(targets, predictions)),
-        "macro_f1": float(f1_score(targets, predictions, average="macro", zero_division=0)),
-    }
+    return {"n_examples": len(targets), **classification_metrics(targets, predictions)}
 
 
 def run(config: Config):
@@ -175,12 +278,8 @@ def run(config: Config):
     examples = create_forecast_examples(frame)
     train_ex, val_ex, test_ex = patient_split(examples, config.seed)
 
-    # Missing-value and scaling statistics are estimated only from training patients.
-    train_matrix = np.stack([e["features"] for e in train_ex])
-    mean = np.nanmean(train_matrix, axis=0)
-    mean = np.where(np.isfinite(mean), mean, 0.0)
-    scale = np.nanstd(train_matrix, axis=0)
-    scale = np.where(np.isfinite(scale) & (scale > 1e-6), scale, 1.0)
+    # Fit preprocessing on training patients only; validation and test remain untouched.
+    mean, scale = fit_preprocessor(train_ex)
 
     train_ds = ForecastDataset(train_ex, mean, scale)
     val_ds = ForecastDataset(val_ex, mean, scale)
@@ -218,9 +317,12 @@ def run(config: Config):
     out.mkdir(parents=True, exist_ok=True)
 
     torch.save({
-        "state_dict": model.state_dict(), "feature_order": FEATURES,
-        "feature_mean": mean.tolist(), "feature_scale": scale.tolist(),
-        "stage_labels": list(range(N_STAGES)), "synthetic_only": True,
+        "state_dict": {key: value.detach().cpu().clone() for key, value in model.state_dict().items()},
+        "feature_order": FEATURES,
+        "feature_mean": mean.tolist(),
+        "feature_scale": scale.tolist(),
+        "stage_labels": list(STAGE_LABELS),
+        "synthetic_only": True,
         "config": asdict(config),
     }, out / "model.pt")
 
@@ -238,13 +340,26 @@ def run(config: Config):
     pd.DataFrame(rows).to_csv(out / "test_predictions.csv", index=False)
     summary = {
         "task": "next-observed-visit stage classification",
-        "synthetic_only": True, "split_unit": "patient",
+        "synthetic_only": True,
+        "split_unit": "patient",
+        "stage_labels": list(STAGE_LABELS),
+        "stage_label_note": "Labels 0-3 are artificial labels generated for this synthetic experiment.",
+        "prediction_task": "next-observed-visit stage classification",
+        "follow_up_note": (
+            "Visit intervals vary. The model uses only the current visit's features; "
+            "the elapsed time to the next visit is not a model input."
+        ),
         "split_sizes": {
-            "train_windows": len(train_ex), "validation_windows": len(val_ex),
+            "train_patients": len({e["patient_id"] for e in train_ex}),
+            "validation_patients": len({e["patient_id"] for e in val_ex}),
+            "test_patients": len({e["patient_id"] for e in test_ex}),
+            "train_windows": len(train_ex),
+            "validation_windows": len(val_ex),
             "test_windows": len(test_ex),
         },
-        "test": test_metrics, "history": history,
-        "interpretation": "Synthetic data only; no clinical validity claim. Follow-up times are irregular.",
+        "test": test_metrics,
+        "history": history,
+        "interpretation": "Synthetic data only; no clinical validity claim.",
     }
     (out / "metrics.json").write_text(json.dumps(summary, indent=2))
     return {"test": test_metrics, "outputs": str(out), "device": str(device)}
@@ -261,6 +376,8 @@ def parse_args():
     args = parser.parse_args()
     if args.patients < 12 or args.epochs < 1 or args.batch_size < 1:
         parser.error("--patients must be >= 12 and epochs/batch-size must be positive")
+    if not np.isfinite(args.learning_rate) or args.learning_rate <= 0:
+        parser.error("--learning-rate must be a finite positive number")
     return Config(args.patients, args.epochs, args.batch_size, args.learning_rate, args.seed, args.output_dir)
 
 
