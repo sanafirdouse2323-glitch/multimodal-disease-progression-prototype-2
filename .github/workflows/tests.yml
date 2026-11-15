@@ -6,17 +6,92 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
-      - run: python -m pip install --upgrade pip
-      - run: python -m pip install -r requirements.txt
-      - run: python -m unittest discover -s tests -v
-      - run: python prototype.py --patients 40 --epochs 1 --batch-size 16 --output-dir results/ci-smoke
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+      - name: Check installed dependencies
+        run: python -m pip check
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Run training smoke test
+        run: python prototype.py --patients 40 --epochs 1 --batch-size 16 --output-dir results/ci-smoke
+      - name: Verify generated outputs and checkpoint
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          import numpy as np
+          import pandas as pd
+
+          from prototype import FEATURES, STAGE_LABELS, load_model_checkpoint
+
+          output_dir = Path("results/ci-smoke")
+          metrics_path = output_dir / "metrics.json"
+          predictions_path = output_dir / "test_predictions.csv"
+          checkpoint_path = output_dir / "model.pt"
+
+          for path in (metrics_path, predictions_path, checkpoint_path):
+              if not path.is_file():
+                  raise AssertionError(f"Expected output was not created: {path}")
+
+          metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+          if metrics.get("synthetic_only") is not True:
+              raise AssertionError("Smoke-run metrics must identify the data as synthetic")
+          if metrics.get("split_unit") != "patient":
+              raise AssertionError("The experiment must split by patient")
+
+          test_metrics = metrics["test"]
+          if test_metrics["n_examples"] <= 0:
+              raise AssertionError("The held-out test set is empty")
+          if len(test_metrics["class_support"]) != len(STAGE_LABELS):
+              raise AssertionError("Test class support does not cover all defined stage labels")
+          if sum(test_metrics["class_support"]) != test_metrics["n_examples"]:
+              raise AssertionError("Test class support does not match the number of test examples")
+          for name in ("accuracy", "macro_f1"):
+              value = test_metrics[name]
+              if not np.isfinite(value) or not 0.0 <= value <= 1.0:
+                  raise AssertionError(f"Invalid {name}: {value}")
+
+          predictions = pd.read_csv(predictions_path)
+          probability_columns = [f"prob_stage_{label}" for label in STAGE_LABELS]
+          required_columns = {"target_stage", "predicted_stage", *probability_columns}
+          if not required_columns.issubset(predictions.columns):
+              raise AssertionError("Prediction output is missing required columns")
+          if len(predictions) != test_metrics["n_examples"]:
+              raise AssertionError("Prediction count does not match held-out test count")
+
+          probabilities = predictions[probability_columns].to_numpy(dtype=float)
+          if not np.isfinite(probabilities).all():
+              raise AssertionError("Prediction probabilities contain non-finite values")
+          if not np.allclose(probabilities.sum(axis=1), 1.0, atol=1e-5):
+              raise AssertionError("Prediction probabilities do not sum to one")
+          if not predictions["target_stage"].isin(STAGE_LABELS).all():
+              raise AssertionError("Prediction targets contain an unknown stage label")
+          if not predictions["predicted_stage"].isin(STAGE_LABELS).all():
+              raise AssertionError("Predictions contain an unknown stage label")
+
+          model, checkpoint = load_model_checkpoint(checkpoint_path)
+          if checkpoint["feature_order"] != FEATURES:
+              raise AssertionError("Saved checkpoint feature order is incorrect")
+          if checkpoint["stage_labels"] != list(STAGE_LABELS):
+              raise AssertionError("Saved checkpoint stage labels are incorrect")
+          if not isinstance(model, object):
+              raise AssertionError("Checkpoint loader did not return a model")
+
+          print("Smoke outputs, probability values and checkpoint reload verified.")
+          PY
