@@ -109,3 +109,24 @@ jobs:
 
           print("Smoke outputs, probability values and checkpoint reload verified.")
           PY
+      - name: Run the README's larger example
+        run: python prototype.py --patients 240 --epochs 12 --batch-size 32 --output-dir results
+      - name: Verify the README example outputs
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          output_dir = Path("results")
+          expected = ("metrics.json", "test_predictions.csv", "model.pt")
+          missing = [name for name in expected if not (output_dir / name).is_file()]
+          if missing:
+              raise AssertionError(f"README example did not create: {missing}")
+
+          metrics = json.loads((output_dir / "metrics.json").read_text(encoding="utf-8"))
+          if metrics.get("synthetic_only") is not True:
+              raise AssertionError("README example metrics must identify the experiment as synthetic")
+          if metrics["test"]["n_examples"] <= 0:
+              raise AssertionError("README example produced an empty test set")
+          print("README example completed and created all expected output files.")
+          PY
